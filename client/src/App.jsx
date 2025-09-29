@@ -1,5 +1,7 @@
-// client/src/App.jsx
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer
+} from "recharts";
 
 function genMsgId() {
   return `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -10,24 +12,15 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [cpId, setCpId] = useState("CP_1");
   const [connected, setConnected] = useState(false);
-  const [autoHeartbeat, setAutoHeartbeat] = useState(false);
-  const hbTimerRef = useRef(null);
-
-  useEffect(() => {
-    return () => {
-      if (hbTimerRef.current) clearInterval(hbTimerRef.current);
-      if (socketRef.current) socketRef.current.close();
-    };
-  }, []);
+  const [charging, setCharging] = useState(false);
+  const [powerData, setPowerData] = useState([]);
+  const [serverPowerData, setServerPowerData] = useState([]);
+  const chargeTimerRef = useRef(null);
 
   const log = (s) => setLogs((l) => [...l, `${new Date().toLocaleTimeString()} ${s}`]);
 
   const connect = () => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      log("Already connected");
-      return;
-    }
-    const url = `wss://ocpp-demo.onrender.com/${cpId}`;
+    const url = `ws://localhost:9000/${cpId}`;
     const ws = new WebSocket(url);
     socketRef.current = ws;
 
@@ -38,16 +31,23 @@ export default function App() {
 
     ws.onmessage = (evt) => {
       log(`RECV: ${evt.data}`);
+      try {
+        const data = JSON.parse(evt.data);
+        if (Array.isArray(data) && data[0] === 3) {
+          const payload = data[2] || {};
+          if (payload.serverReceivedPower !== undefined) {
+            // t 用 powerData 长度保证时间轴对齐
+            const t = powerData.length;
+            setServerPowerData((prev) => [...prev, { time: t, power: payload.serverReceivedPower }]);
+          }
+        }
+      } catch (e) { /* empty */ }
     };
 
     ws.onclose = () => {
       setConnected(false);
       log("Connection closed");
-    };
-
-    ws.onerror = (err) => {
-      log("WebSocket error");
-      console.error(err);
+      stopCharging();
     };
   };
 
@@ -56,6 +56,7 @@ export default function App() {
       socketRef.current.close();
       socketRef.current = null;
       setConnected(false);
+      stopCharging();
       log("Disconnected by user");
     }
   };
@@ -71,92 +72,57 @@ export default function App() {
   }
 
   const sendBootNotification = () => {
-    const msg = [2, genMsgId(), "BootNotification", { chargePointVendor: "DemoVendor", chargePointModel: "SimModel-1" }];
-    sendRaw(msg);
+    sendRaw([2, genMsgId(), "BootNotification", { chargePointVendor: "DemoVendor", chargePointModel: "SimModel-1" }]);
   };
 
-  const sendHeartbeat = () => {
-    const msg = [2, genMsgId(), "Heartbeat", {}];
-    sendRaw(msg);
-  };
+  const startCharging = () => {
+    if (!connected) return;
+    sendRaw([2, genMsgId(), "StartTransaction", { connectorId: 1, idTag: "TEST_ID_001", meterStart: 0, timestamp: new Date().toISOString() }]);
 
-  const sendStartTransaction = () => {
-    const msg = [
-      2,
-      genMsgId(),
-      "StartTransaction",
-      {
+    setCharging(true);
+    setPowerData([]);
+    setServerPowerData([]);
+    let t = 0;
+
+    chargeTimerRef.current = setInterval(() => {
+      let power;
+      if (t < 30) power = t * 0.5 + Math.random();
+      else if (t < 120) power = 15 + Math.random();
+      else power = Math.max(0, 15 - (t - 120) * 0.2 + Math.random());
+
+      const newPoint = { time: t, power: parseFloat(power.toFixed(2)) };
+      setPowerData((prev) => [...prev, newPoint]);
+
+      sendRaw([2, genMsgId(), "MeterValues", {
         connectorId: 1,
-        idTag: "TEST_ID_001",
-        meterStart: 0,
-        timestamp: new Date().toISOString()
-      }
-    ];
-    sendRaw(msg);
+        meterValue: [{ timestamp: new Date().toISOString(), sampledValue: [{ value: newPoint.power, unit: "kW" }] }]
+      }]);
+
+      t++;
+    }, 1000);
   };
 
-  const sendStopTransaction = () => {
-    const msg = [
-      2,
-      genMsgId(),
-      "StopTransaction",
-      {
-        connectorId: 1,
-        meterStop: Math.floor(Math.random() * 10000),
-        timestamp: new Date().toISOString()
-      }
-    ];
-    sendRaw(msg);
-  };
-
-  const sendMeterValues = () => {
-    const msg = [
-      2,
-      genMsgId(),
-      "MeterValues",
-      {
-        connectorId: 1,
-        transactionId: null,
-        meterValue: [
-          {
-            timestamp: new Date().toISOString(),
-            sampledValue: [{ value: (Math.random() * 20).toFixed(2), unit: "kW" }]
-          }
-        ]
-      }
-    ];
-    sendRaw(msg);
-  };
-
-  const sendBadJson = () => {
-    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
-      log("Socket not open");
-      return;
+  const stopCharging = () => {
+    if (chargeTimerRef.current) {
+      clearInterval(chargeTimerRef.current);
+      chargeTimerRef.current = null;
     }
-    socketRef.current.send("THIS IS NOT JSON");
-    log("SEND: THIS IS NOT JSON");
+    if (charging) {
+      sendRaw([2, genMsgId(), "StopTransaction", { connectorId: 1, meterStop: Math.floor(Math.random() * 10000), timestamp: new Date().toISOString() }]);
+      setCharging(false);
+    }
   };
 
-  // autohb toggle
-  useEffect(() => {
-    if (autoHeartbeat) {
-      sendHeartbeat();
-      hbTimerRef.current = setInterval(sendHeartbeat, 10000);
-    } else {
-      if (hbTimerRef.current) {
-        clearInterval(hbTimerRef.current);
-        hbTimerRef.current = null;
-      }
-    }
-    return () => {
-      if (hbTimerRef.current) clearInterval(hbTimerRef.current);
-    };
-  }, [autoHeartbeat]);
+  // 合并数据绘图
+  const mergedData = powerData.map((p, idx) => ({
+    time: p.time,
+    simPower: p.power,
+    serverPower: serverPowerData[idx]?.power ?? null
+  }));
 
   return (
     <div style={{ padding: 16, fontFamily: "Arial, sans-serif" }}>
-      <h1>EV Charger Simulator (Browser)</h1>
-
+      <h1>EV Charger Simulator</h1>
       <div style={{ marginBottom: 8 }}>
         <label>ChargePoint ID: </label>
         <input value={cpId} onChange={(e) => setCpId(e.target.value)} />
@@ -166,28 +132,26 @@ export default function App() {
 
       <div style={{ marginBottom: 8 }}>
         <button onClick={sendBootNotification} disabled={!connected}>BootNotification</button>
-        <button onClick={sendHeartbeat} disabled={!connected} style={{ marginLeft: 8 }}>Heartbeat</button>
-        <button onClick={sendStartTransaction} disabled={!connected} style={{ marginLeft: 8 }}>StartTransaction</button>
-        <button onClick={sendStopTransaction} disabled={!connected} style={{ marginLeft: 8 }}>StopTransaction</button>
-        <button onClick={sendMeterValues} disabled={!connected} style={{ marginLeft: 8 }}>MeterValues</button>
+        <button onClick={startCharging} disabled={!connected || charging} style={{ marginLeft: 8 }}>Start Charging</button>
+        <button onClick={stopCharging} disabled={!connected || !charging} style={{ marginLeft: 8 }}>Stop Charging</button>
       </div>
 
-      <div style={{ marginBottom: 8 }}>
-        <label>
-          <input type="checkbox" checked={autoHeartbeat} onChange={(e) => setAutoHeartbeat(e.target.checked)} />
-          Auto Heartbeat (every 10s)
-        </label>
-
-        <button onClick={sendBadJson} style={{ marginLeft: 16 }}>Send Bad JSON</button>
+      <h2>Power Curve</h2>
+      <div style={{ height: 300, background: "#fff", padding: 8, border: "1px solid #ddd" }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={mergedData}>
+            <CartesianGrid stroke="#ccc" strokeDasharray="5 5" />
+            <XAxis dataKey="time" label={{ value: "Time (s)", position: "insideBottomRight", offset: -5 }} />
+            <YAxis label={{ value: "Power (kW)", angle: -90, position: "insideLeft" }} />
+            <Tooltip />
+            <Line type="monotone" dataKey="simPower" stroke="#007BFF" name="Simulated Power" dot={false} />
+            <Line type="monotone" dataKey="serverPower" stroke="#FF4500" name="Server Received" dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
       </div>
 
-      <div style={{
-        border: "1px solid #ddd",
-        height: 360,
-        overflow: "auto",
-        padding: 8,
-        background: "#fafafa"
-      }}>
+      <h2>Logs</h2>
+      <div style={{ border: "1px solid #ddd", height: 200, overflow: "auto", padding: 8, background: "#fafafa" }}>
         {logs.map((l, i) => <div key={i} style={{ fontSize: 12 }}>{l}</div>)}
       </div>
     </div>
