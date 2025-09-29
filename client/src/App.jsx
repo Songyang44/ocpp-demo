@@ -27,7 +27,7 @@ export default function App() {
       log("Already connected");
       return;
     }
-    const url = `ws://localhost:9000/${cpId}`;
+    const url = `wss://ocpp-demo.onrender.com/${cpId}`;
     const ws = new WebSocket(url);
     socketRef.current = ws;
 
